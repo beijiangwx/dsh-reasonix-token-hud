@@ -86,7 +86,7 @@ DeepSeek Harness 的右侧栏插件：实时监控**当前会话**的 token 用�
 dsh plugin add reasonix-token-hud
 
 # 或者直接用打包好的 tarball
-dsh plugin add ./reasonix-token-hud-1.0.1.tgz
+dsh plugin add ./reasonix-token-hud-1.0.2.tgz
 ```
 
 ### Desktop（本机 profile）
