@@ -1,0 +1,5 @@
+# reasonix-token-hud bundle patch：把「用量与费用」HUD 插入 profile 的 layer 栈。
+# 选择本包到 dsh.profile.bundles 后，该 insert 生效。
+- insert:
+    - id: reasonix-token-hud
+      name: 'reasonix-token-hud'
