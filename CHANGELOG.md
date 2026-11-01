@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2 — 2026-11-01
+
+Metadata fix: the package now points at the actual repository,
+<https://github.com/beijiangwx/dsh-reasonix-token-hud>. No runtime changes.
+
 ## 1.0.1 — 2026-11-01
 
 First public release, renamed from the internal `dsh-usage-hud` build.
