@@ -1,0 +1,70 @@
+{
+  "name": "reasonix-token-hud-dshgo",
+  "version": "1.0.0-android",
+  "description": "Reasonix Token HUD for dsh-go: live session token usage, context occupancy, estimated CNY cost and account balance in the native phone app.",
+  "type": "module",
+  "main": "lib/index.js",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0"
+  },
+  "dshGo": {
+    "v": 1,
+    "title": { "zh": "用量与费用", "en": "Usage & Cost" },
+    "icon": "coin",
+    "wants": [],
+    "contributes": {
+      "composer.actions": [
+        {
+          "id": "copy",
+          "label": { "zh": "复制用量", "en": "Copy usage" },
+          "icon": "copy"
+        }
+      ],
+      "composer.strip": [
+        { "id": "strip", "icon": "coin", "panel": "hud" }
+      ],
+      "panels": [
+        {
+          "id": "hud",
+          "title": "用量与费用",
+          "icon": "coin",
+          "placement": ["session.tab", "features", "chat.panel"]
+        }
+      ]
+    }
+  },
+  "files": [
+    "lib/index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh-go",
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "token",
+    "cost",
+    "reasonix",
+    "android"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beijiangwx/dsh-reasonix-token-hud.git",
+    "directory": "dshgo"
+  },
+  "homepage": "https://github.com/beijiangwx/dsh-reasonix-token-hud/tree/main/dshgo#readme",
+  "bugs": {
+    "url": "https://github.com/beijiangwx/dsh-reasonix-token-hud/issues"
+  },
+  "author": "beijiangwx",
+  "publishConfig": {
+    "access": "public"
+  }
+}
