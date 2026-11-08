@@ -7,6 +7,11 @@ GitHub: <https://github.com/beijiangwx/dsh-reasonix-token-hud>
 
 DeepSeek Harness 的右侧栏插件：实时监控**当前会话**的 token 用量、上下文占用与会话费用，并在底栏显示账户余额。
 
+## 两个版本
+
+- **网页 / 桌面（Cordis）**：`reasonix-token-hud` —— 右侧栏标签页、头部费用胶囊、底栏余额。
+- **手机 dsh-go 原生**：`reasonix-token-hud-dshgo` —— 输入框上方状态条 + 原生面板，源码在 [`dshgo/`](./dshgo)。
+
 > 名字里的 “Reasonix” 只是向 Reasonix 的 HUD 思路致敬；本项目是独立的 DSH 插件，与 DeepSeek-Reasonix 项目没有隶属或背书关系。
 
 - **右侧栏「用量与费用」标签页** —— 费用大数字、上下文占用条、四类 token 明细、费用构成、按模型/峰谷拆分，以及可编辑的计价设置。
