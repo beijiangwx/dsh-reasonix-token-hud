@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.6 — 2026-11-25
+
+dsh-go native package: the strip drops the per-turn figure.
+
+- The strip no longer carries a per-turn amount (`本轮¥0.16` / `第3轮¥0.16`). It shows the
+  session total, the price-tier countdown and the account balance only:
+  `总¥2.86 · 25m后峰 · 余¥95`. The per-turn figure was hard to read at a glance, and the
+  pinned variant needed a second long-press to undo.
+- The「钉住本轮」reply-menu item and its per-session pin state are gone, along with the
+  panel line that described which turn the strip was following. The menu is back to
+  「本轮费用」alone.
+- Per-turn costs are not lost: the panel keeps its per-turn table, the turn footnote keeps
+  its note, and long-pressing a reply still reports that reply's own turn.
+
 ## 1.0.5 — 2026-11-25
 
 dsh-go native package: pin a turn to the status strip.
