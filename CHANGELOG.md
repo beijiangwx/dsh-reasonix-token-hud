@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.5 — 2026-11-25
+
+dsh-go native package: pin a turn to the status strip.
+
+- New reply-menu item「钉住本轮」: holds that reply's turn on the strip, labelled with its
+  number (`总¥0.04·第3轮¥0.16·25m后峰`) so an older turn is never read as the latest.
+  Tapping the same turn again releases it; tapping another turn moves the pin.
+- The strip repaints on the tap rather than at the next tick, and the panel's new line
+  says which turn the strip is showing (`跟着最新` / `状态条已钉住`).
+- Pins are per session, kept in memory only: switching conversations does not carry them
+  across, and a restart starts unpinned.
+
 ## 1.0.4 — 2026-11-25
 
 dsh-go native package: per-turn cost, peak / off-peak countdown.

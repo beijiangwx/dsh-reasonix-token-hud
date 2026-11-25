@@ -1,6 +1,6 @@
 {
   "name": "reasonix-token-hud-dshgo",
-  "version": "1.0.4-android",
+  "version": "1.0.5-android",
   "description": "Reasonix Token HUD for dsh-go: live session token usage, per-turn cost on each turn footnote, peak/off-peak hints, estimated CNY cost and account balance in the native phone app.",
   "type": "module",
   "main": "lib/index.js",
@@ -29,7 +29,8 @@
         { "id": "strip", "icon": "coin", "panel": "hud" }
       ],
       "message.actions": [
-        { "id": "turn-cost", "label": { "zh": "本轮费用", "en": "This turn" }, "icon": "coin" }
+        { "id": "turn-cost", "label": { "zh": "本轮费用", "en": "This turn" }, "icon": "coin" },
+        { "id": "pin-turn", "label": { "zh": "钉住本轮", "en": "Pin turn" }, "icon": "pin" }
       ],
       "turn.note": [{ "id": "turncost" }],
       "panels": [

@@ -437,6 +437,55 @@ function fmtBalanceShort(amount, currency) {
   return symbol + n.toFixed(2)
 }
 
+// ── pinned turn (one per session, set from a reply's long-press menu) ────────
+// The strip normally shows the newest turn. Pinning holds one chosen turn there until
+// the same turn is tapped again, so "which turn am I looking at" is answered by the
+// person instead of guessed from a scroll position the app never reports.
+const pinnedTurns = new Map() // sessionId -> turn number
+
+function pinnedTurnOf(sessionId) {
+  return sessionId ? pinnedTurns.get(sessionId) : undefined
+}
+
+/** The pinned turn's entry when it still exists in this log; clears a stale pin. */
+function pinnedEntryOf(usage, sessionId) {
+  const pinned = pinnedTurnOf(sessionId)
+  if (pinned === undefined) return undefined
+  const entry = usage.turns.find((turn) => turn.turn === pinned)
+  if (entry === undefined) pinnedTurns.delete(sessionId)
+  return entry
+}
+
+/**
+ * Repaint hooks of the live feeds, by session. A strip cannot be refreshed through the
+ * bridge — `stale` only re-reads a panel — so pinning calls these directly and the strip
+ * changes on the tap instead of at the next tick.
+ */
+const repainters = new Map() // sessionId -> Set<() => void>
+
+function addRepainter(sessionId, fn) {
+  if (!sessionId) return () => {}
+  let set = repainters.get(sessionId)
+  if (set === undefined) repainters.set(sessionId, (set = new Set()))
+  set.add(fn)
+  return () => {
+    set.delete(fn)
+    if (set.size === 0 && repainters.get(sessionId) === set) repainters.delete(sessionId)
+  }
+}
+
+function repaintSession(sessionId) {
+  const set = repainters.get(sessionId)
+  if (set === undefined) return
+  for (const fn of [...set]) {
+    try {
+      fn()
+    } catch {
+      /* one feed's failure must not stop the others */
+    }
+  }
+}
+
 // ── account balance (optional service) ───────────────────────────────────────
 const balanceState = { at: 0, text: '—', amount: null, currency: 'CNY', tone: undefined }
 let balanceInflight = null
@@ -523,8 +572,11 @@ function turnTierLabel(turn) {
  * The strip is the reliable place for the numbers: 24 characters, and it always shows
  * when a turn ends. Order of sacrifice when it does not fit: account balance, tokens,
  * then the peak / off-peak hint; the current turn's cost is never dropped.
+ *
+ * A pinned turn takes the place of the newest one and is labelled with its number
+ * (`第3轮¥0.16`), so a number from an older turn is never read as the latest.
  */
-function stripText(usage) {
+function stripText(usage, sessionId) {
   const now = Date.now()
   const nowTier = tierShort(tierAt(now))
   const next = nextTierSwitch(now)
@@ -534,8 +586,13 @@ function stripText(usage) {
     next === null ? nowTier : `${fmtSpanShort(next.at - now)}后${next.tier === 'off' ? '谷' : '峰'}`
   if (!usage || usage.tokens === 0) return `暂无用量 · ${until}`
   const total = `总${fmtCostShort(usage.cost)}`
+  const pinned = pinnedEntryOf(usage, sessionId)
   const last = usage.turns.at(-1)
-  const turn = last ? `本轮${fmtTurnMoney(last.cost)}` : null
+  const turn = pinned
+    ? `第${pinned.turn}轮${fmtTurnMoney(pinned.cost)}`
+    : last
+      ? `本轮${fmtTurnMoney(last.cost)}`
+      : null
   const tokens = fmtTokens(usage.tokens)
   const balance =
     balanceState.amount !== null ? `余${fmtBalanceShort(balanceState.amount, balanceState.currency)}` : null
@@ -560,14 +617,27 @@ function stripText(usage) {
   return [...total].slice(0, 24).join('')
 }
 
-function panelData(usage) {
+function panelData(usage, sessionId) {
   const pct = usage.contextPct
   const nowTier = tierAt(Date.now())
   const latest = usage.turns.at(-1)
+  const pinned = pinnedEntryOf(usage, sessionId)
   return {
     cost: fmtMoney(usage.cost),
     lastTurn: latest ? fmtTurnMoney(latest.cost) : '—',
     lastTurnLabel: latest ? `第 ${latest.turn} 轮（${turnTierLabel(latest)}）` : '还没有完成的回合',
+    // What the strip is showing: a pinned turn, or the newest one.
+    shownTurn: pinned ? fmtTurnMoney(pinned.cost) : latest ? fmtTurnMoney(latest.cost) : '—',
+    shownTurnLabel: pinned
+      ? `第 ${pinned.turn} 轮（${turnTierLabel(pinned)}）· 状态条已钉住`
+      : latest
+        ? `第 ${latest.turn} 轮（${turnTierLabel(latest)}）· 跟着最新`
+        : '还没有完成的回合',
+    shownText: pinned
+      ? `状态条钉在「第 ${pinned.turn} 轮 ${fmtTurnMoney(pinned.cost)}」；再长按这条回复点一次「钉住本轮」即可取消。`
+      : '状态条显示最新一轮；长按任意回复 ›「钉住本轮」可把那一轮固定到状态条。',
+    shownTone: pinned ? 'warn' : 'info',
+    pinned: pinned !== undefined,
     tierCaption: `CNY · 现在${tierShort(nowTier)}${nowTier === 'off' ? '（半价）' : '（全价）'}`,
     // "谷时 · 1小时12分后进入峰时" — the same countdown the desktop cost meter shows.
     tierSwitch: nextTierSwitch(Date.now()) === null ? '' : tierSwitchText(Date.now()),
@@ -642,6 +712,11 @@ const VIEW = {
         { type: 'metric', label: '本轮', value: { $: 'data.lastTurn' }, caption: { $: 'data.lastTurnLabel' } }
       ]
     },
+    {
+      type: 'callout',
+      text: { $: 'data.shownText' },
+      tone: { $: 'data.shownTone' }
+    },
     { type: 'callout', text: { $: 'data.tierSwitch' }, tone: 'info' },
     { type: 'callout', text: { $: 'data.tierHint' }, tone: 'info' },
     {
@@ -715,6 +790,35 @@ export function apply(ctx) {
       return { copy: `第 ${turn.turn} 轮费用：${fmtMoney(turn.cost)} ${turnTierLabel(turn)}`, toast: text }
     })
 
+    // Long-press a reply → hold its turn on the strip. Tapping the same turn again releases
+    // it, so the menu item is the switch for both directions. The strip refetches at once
+    // instead of waiting for the next tick.
+    ctx.dshGo.on('pin-turn', (scope) => {
+      const usage = computeUsage(ctx, scope.sessionId)
+      const byMessage = scope.messageId ? usage.messageTurns.get(scope.messageId) : undefined
+      if (scope.messageId && byMessage === undefined && usage.messageTurns.size > 0) {
+        return { toast: '这条回复还没结算，稍后再看' }
+      }
+      const turn =
+        (byMessage === undefined ? undefined : usage.turns.find((t) => t.turn === byMessage)) ?? usage.turns.at(-1)
+      if (!turn) return { toast: '这一轮还没有费用记录' }
+      const pinned = pinnedTurnOf(scope.sessionId)
+      const clear = () => {
+        // The strip lives in this process: repaint it now. The panel is the bridge's own
+        // feed; `stale` is what makes it read the view again.
+        repaintSession(scope.sessionId)
+        ctx.dshGo.refresh('hud', { sessionId: scope.sessionId })
+      }
+      if (pinned === turn.turn) {
+        pinnedTurns.delete(scope.sessionId)
+        clear()
+        return { toast: '已取消钉住，状态条回到最新一轮' }
+      }
+      pinnedTurns.set(scope.sessionId, turn.turn)
+      clear()
+      return { toast: `状态条钉在「第 ${turn.turn} 轮 ${fmtTurnMoney(turn.cost)}」` }
+    })
+
     ctx.dshGo.on('copy', (scope) => {
       const usage = computeUsage(ctx, scope.sessionId)
       if (usage.tokens === 0) return { toast: '当前会话还没有用量' }
@@ -726,7 +830,7 @@ export function apply(ctx) {
       const render = () => {
         if (stopped) return
         const usage = computeUsage(ctx, scope.sessionId)
-        const effect = { text: stripText(usage), icon: 'coin' }
+        const effect = { text: stripText(usage, scope.sessionId), icon: 'coin' }
         if (balanceState.tone) effect.tone = balanceState.tone
         emit(effect)
       }
@@ -735,9 +839,12 @@ export function apply(ctx) {
         void refreshBalance(ctx, caps).then(render)
       }
       tick()
+      // A pin change repaints immediately instead of waiting for the next tick.
+      const removeRepainter = addRepainter(scope.sessionId, render)
       const timer = setInterval(tick, TICK_MS)
       return () => {
         stopped = true
+        removeRepainter()
         clearInterval(timer)
       }
     })
@@ -748,16 +855,18 @@ export function apply(ctx) {
         let stopped = false
         const push = () => {
           if (stopped) return
-          emit(panelData(computeUsage(ctx, scope.sessionId)))
+          emit(panelData(computeUsage(ctx, scope.sessionId), scope.sessionId))
         }
         const tick = () => {
           push()
           void refreshBalance(ctx, caps).then(push)
         }
         tick()
+        const removeRepainter = addRepainter(scope.sessionId, push)
         const timer = setInterval(tick, TICK_MS)
         return () => {
           stopped = true
+          removeRepainter()
           clearInterval(timer)
         }
       }
