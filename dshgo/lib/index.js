@@ -10,6 +10,8 @@ export const name = 'reasonix-token-hud-dshgo'
 
 const TICK_MS = 3000
 const BALANCE_TTL_MS = 5 * 60 * 1000
+/** How many reply ids the per-message lookup remembers (oldest dropped first). */
+const MESSAGE_TURNS_MAX = 5000
 const RATES = { input: 2, cacheRead: 0.04, output: 8 } // CNY / 1M peak tokens
 const HALF = 0.5
 
@@ -28,15 +30,107 @@ const num = (value) => {
 
 const totalOf = (b) => b.uncachedInput + b.cacheRead + b.cacheWrite + b.output
 
-/** Beijing peak: weekdays 09:00–12:00 and 14:00–18:00; everything else is half price. */
+// Official pricing (api-docs.deepseek.com › Models & Pricing): peak is 01:00–04:00 and
+// 06:00–10:00 UTC, Monday–Friday; off-peak is half price; Chinese public holidays are
+// off-peak all day. The holiday calendar changes every year, so this plugin ships none:
+// set PEAK_HOLIDAYS to a JSON array of Beijing-time `YYYY-MM-DD` days and they count as
+// off-peak. Unset means weekends + the daily time windows only.
+function holidaySet() {
+  const env = process.env.PEAK_HOLIDAYS
+  if (typeof env !== 'string' || env.trim() === '') return new Set()
+  try {
+    const list = JSON.parse(env)
+    if (!Array.isArray(list)) return new Set()
+    return new Set(list.filter((day) => typeof day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(day)))
+  } catch {
+    // A broken override must not break the HUD.
+    return new Set()
+  }
+}
+
+const HOLIDAYS = holidaySet()
+
+/** Beijing calendar day (`YYYY-MM-DD`) of an epoch millisecond. */
+function beijingDay(time) {
+  const d = new Date(time + 8 * 60 * 60 * 1000)
+  const month = String(d.getUTCMonth() + 1).padStart(2, '0')
+  const day = String(d.getUTCDate()).padStart(2, '0')
+  return `${d.getUTCFullYear()}-${month}-${day}`
+}
+
+// Peak windows in Beijing wall-clock minutes since midnight.
+const PEAK_WINDOWS = [
+  [9 * 60, 12 * 60],
+  [14 * 60, 18 * 60]
+]
+
+/** Beijing peak: workdays 09:00–12:00 and 14:00–18:00; weekends and holidays are half price. */
 function tierAt(time) {
   const t = typeof time === 'number' && Number.isFinite(time) ? time : Date.now()
   const d = new Date(t + 8 * 60 * 60 * 1000)
   const day = d.getUTCDay()
   if (day === 0 || day === 6) return 'off'
+  if (HOLIDAYS.has(beijingDay(t))) return 'off'
   const minutes = d.getUTCHours() * 60 + d.getUTCMinutes()
-  const peak = (minutes >= 9 * 60 && minutes < 12 * 60) || (minutes >= 14 * 60 && minutes < 18 * 60)
-  return peak ? 'peak' : 'off'
+  return PEAK_WINDOWS.some(([from, to]) => minutes >= from && minutes < to) ? 'peak' : 'off'
+}
+
+/** '1h12m' / '48m' / '2d14h' — the same span, squeezed for the 24-character strip. */
+function fmtSpanShort(ms) {
+  const total = Math.max(0, Math.round(ms / 60000))
+  if (total >= 24 * 60) {
+    const days = Math.floor(total / (24 * 60))
+    const hours = Math.floor((total % (24 * 60)) / 60)
+    return hours === 0 ? `${days}d` : `${days}d${hours}h`
+  }
+  if (total >= 60) {
+    const hours = Math.floor(total / 60)
+    const minutes = total % 60
+    return minutes === 0 ? `${hours}h` : `${hours}h${minutes}m`
+  }
+  return `${total}m`
+}
+
+/** '1小时12分' / '48分' / '3分' — how long until the next tier switch. */
+function fmtSpan(ms) {
+  const total = Math.max(0, Math.round(ms / 60000))
+  if (total >= 60) {
+    const hours = Math.floor(total / 60)
+    const minutes = total % 60
+    return minutes === 0 ? `${hours}小时` : `${hours}小时${minutes}分`
+  }
+  return `${total}分`
+}
+
+/**
+ * When the price tier next changes: { at, tier } (epoch ms and the tier it changes to),
+ * or null within a year. Walks minute-aligned candidate boundaries in Beijing time, so it
+ * follows weekend / holiday edges as well as the two daily windows.
+ */
+function nextTierSwitch(time) {
+  const t = typeof time === 'number' && Number.isFinite(time) ? time : Date.now()
+  const current = tierAt(t)
+  // Boundaries can only fall on a window edge or a Beijing midnight; step to the next one.
+  const step = 60 * 1000
+  const limit = t + 370 * 24 * 60 * 60 * 1000
+  // Start at the next whole minute to keep the scan cheap and the answer exact enough.
+  let probe = Math.floor(t / step) * step + step
+  while (probe <= limit) {
+    const tier = tierAt(probe)
+    if (tier !== current) return { at: probe, tier }
+    const d = new Date(probe + 8 * 60 * 60 * 1000)
+    const minutes = d.getUTCHours() * 60 + d.getUTCMinutes()
+    // Jump straight to the next candidate instead of walking every minute.
+    const edges = [...PEAK_WINDOWS.flat(), 24 * 60]
+    const upcoming = edges.filter((edge) => edge > minutes)
+    if (upcoming.length === 0) {
+      // Past the last edge of the day: next Beijing midnight.
+      probe += (24 * 60 - minutes) * 60 * 1000
+    } else {
+      probe += (Math.min(...upcoming) - minutes) * 60 * 1000
+    }
+  }
+  return null
 }
 
 function streamUsage(stream) {
@@ -124,8 +218,41 @@ function emptyUsage() {
     requests: 0,
     peakTokens: 0,
     offTokens: 0,
-    models: []
+    peakCost: 0,
+    offCost: 0,
+    models: [],
+    turns: [],
+    messageTurns: new Map()
   }
+}
+
+/** One turn's running total while the log is folded. */
+function turnEntry(turn) {
+  return {
+    turn,
+    uncachedInput: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    output: 0,
+    cost: 0,
+    peakTokens: 0,
+    offTokens: 0
+  }
+}
+
+/** Add (sign = 1) or remove (sign = -1) one sample from a turn's total. */
+function addTurn(map, rec, sign) {
+  const entry = map.get(rec.turn) ?? turnEntry(rec.turn)
+  entry.uncachedInput = Math.max(0, entry.uncachedInput + sign * rec.uncachedInput)
+  entry.cacheRead = Math.max(0, entry.cacheRead + sign * rec.cacheRead)
+  entry.cacheWrite = Math.max(0, entry.cacheWrite + sign * rec.cacheWrite)
+  entry.output = Math.max(0, entry.output + sign * rec.output)
+  entry.cost = Math.max(0, entry.cost + sign * costOfBucket(rec))
+  const tokens = totalOf(rec)
+  if (rec.tier === 'off') entry.offTokens = Math.max(0, entry.offTokens + sign * tokens)
+  else entry.peakTokens = Math.max(0, entry.peakTokens + sign * tokens)
+  if (totalOf(entry) === 0 && entry.cost < 1e-9) map.delete(rec.turn)
+  else map.set(rec.turn, entry)
 }
 
 /**
@@ -147,6 +274,7 @@ function foldSession(session) {
 
   const totals = { uncachedInput: 0, cacheRead: 0, cacheWrite: 0, output: 0, requests: 0 }
   const buckets = new Map()
+  const turns = new Map()
   let last = null
   let origin = null
   let contextWindow = null
@@ -173,6 +301,18 @@ function foldSession(session) {
         if (last && last.turn === event.data?.turn && last.step === event.data?.step) last = null
         continue
       }
+      // Every reply gets an id→turn entry, whether or not it carried usage: the app sends
+      // that id when the person long-presses the reply, and the turn may have settled earlier.
+      if (event.type === 'assistant/message') {
+        const id = event.data?.message?.id
+        const turn = event.data?.turn
+        if (typeof id === 'string' && id !== '' && Number.isInteger(turn)) {
+          summary.messageTurns.set(id, turn)
+          if (summary.messageTurns.size > MESSAGE_TURNS_MAX) {
+            summary.messageTurns.delete(summary.messageTurns.keys().next().value)
+          }
+        }
+      }
       const sample = usageOf(event)
       if (!sample) continue
       if (!Number.isInteger(sample.turn) || !Number.isInteger(sample.step)) continue
@@ -190,9 +330,11 @@ function foldSession(session) {
       if (last && last.turn === rec.turn && last.step === rec.step) {
         addTotals(totals, last, -1)
         addBucket(buckets, last, -1)
+        addTurn(turns, last, -1)
       }
       addTotals(totals, rec, 1)
       addBucket(buckets, rec, 1)
+      addTurn(turns, rec, 1)
       last = rec
       lastPrompt = b.uncachedInput + b.cacheRead + b.cacheWrite
     } catch {
@@ -216,10 +358,16 @@ function foldSession(session) {
 
   const models = new Map()
   for (const bucket of buckets.values()) {
-    summary.cost += costOfBucket(bucket)
+    const bucketCost = costOfBucket(bucket)
+    summary.cost += bucketCost
     summary.saved += savedOfBucket(bucket)
-    if (bucket.tier === 'off') summary.offTokens += totalOf(bucket)
-    else summary.peakTokens += totalOf(bucket)
+    if (bucket.tier === 'off') {
+      summary.offTokens += totalOf(bucket)
+      summary.offCost += bucketCost
+    } else {
+      summary.peakTokens += totalOf(bucket)
+      summary.peakCost += bucketCost
+    }
     const name = bucket.model ?? '未知模型'
     const model = models.get(name) ?? { name, tokens: 0, cost: 0 }
     model.tokens += totalOf(bucket)
@@ -227,6 +375,7 @@ function foldSession(session) {
     models.set(name, model)
   }
   summary.models = [...models.values()].sort((a, b) => b.cost - a.cost)
+  summary.turns = [...turns.values()].sort((a, b) => a.turn - b.turn)
   return summary
 }
 
@@ -244,6 +393,16 @@ function fmtCostShort(value) {
   if (n === 0) return '¥0'
   if (n < 0.01) return '¥' + n.toFixed(3)
   return '¥' + n.toFixed(2)
+}
+
+/** A turn's cost: 2–4 decimals by magnitude, trailing zeros trimmed; a tiny charge stays visible. */
+function fmtTurnMoney(value) {
+  const n = Number(value) || 0
+  if (n <= 0) return '¥0'
+  if (n < 0.0001) return '<¥0.0001'
+  if (n >= 1) return '¥' + n.toFixed(2)
+  // 3 decimals from ¥0.01 up, 4 below it; never trimmed, so the shown value is the billed one.
+  return '¥' + n.toFixed(n >= 0.01 ? 3 : 4)
 }
 
 function fmtTokens(value) {
@@ -342,20 +501,80 @@ function computeUsage(ctx, sessionId) {
 }
 
 // ── dsh-go surfaces ──────────────────────────────────────────────────────────
+const tierShort = (tier) => (tier === 'off' ? '谷时' : '峰时')
+
+/** `谷时 · 1小时12分后进入峰时（09:00）`. Empty when the next switch is unknown. */
+function tierSwitchText(now) {
+  const next = nextTierSwitch(now)
+  if (next === null) return ''
+  // Shift to Beijing and read UTC fields: toTimeString would apply the host zone twice.
+  const d = new Date(next.at + 8 * 60 * 60 * 1000)
+  const clock = `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`
+  return `${tierShort(tierAt(now))} · ${fmtSpan(next.at - now)}后进入${tierShort(next.tier)}（${clock}）`
+}
+
+/** The tier one turn was billed at; a turn that crossed a boundary shows both. */
+function turnTierLabel(turn) {
+  if (turn.peakTokens > 0 && turn.offTokens > 0) return '峰+谷'
+  return turn.offTokens > 0 ? '谷时' : '峰时'
+}
+
+/**
+ * The strip is the reliable place for the numbers: 24 characters, and it always shows
+ * when a turn ends. Order of sacrifice when it does not fit: account balance, tokens,
+ * then the peak / off-peak hint; the current turn's cost is never dropped.
+ */
 function stripText(usage) {
-  if (!usage || usage.tokens === 0) return '暂无用量'
-  const base = `${fmtCostShort(usage.cost)} · ${fmtTokens(usage.tokens)}`
-  if (balanceState.amount !== null) {
-    const withBalance = `${base} · 余${fmtBalanceShort(balanceState.amount, balanceState.currency)}`
-    if (withBalance.length <= 24) return withBalance
+  const now = Date.now()
+  const nowTier = tierShort(tierAt(now))
+  const next = nextTierSwitch(now)
+  // "1h4m后峰" replaces the plain tier: it names the coming window and implies the current
+  // one, so the strip carries the countdown without getting longer.
+  const until =
+    next === null ? nowTier : `${fmtSpanShort(next.at - now)}后${next.tier === 'off' ? '谷' : '峰'}`
+  if (!usage || usage.tokens === 0) return `暂无用量 · ${until}`
+  const total = `总${fmtCostShort(usage.cost)}`
+  const last = usage.turns.at(-1)
+  const turn = last ? `本轮${fmtTurnMoney(last.cost)}` : null
+  const tokens = fmtTokens(usage.tokens)
+  const balance =
+    balanceState.amount !== null ? `余${fmtBalanceShort(balanceState.amount, balanceState.currency)}` : null
+  // Priority: session total, this turn, the price countdown, then the account balance.
+  // Each shape tries the roomy separator first, so a lower-priority number never crowds out
+  // a higher-priority one just because it happens to fit on a shorter line.
+  const shapes = [
+    [total, turn, until, balance],
+    [total, turn, until],
+    [total, turn],
+    [total, until],
+    [total, nowTier],
+    [total]
+  ]
+  for (const shape of shapes) {
+    const parts = shape.filter((part) => part !== null && part !== undefined)
+    for (const sep of [' · ', '·']) {
+      const line = parts.join(sep)
+      if (line.length <= 24) return line
+    }
   }
-  return base.length <= 24 ? `${base} tok` : base.slice(0, 24)
+  return [...total].slice(0, 24).join('')
 }
 
 function panelData(usage) {
   const pct = usage.contextPct
+  const nowTier = tierAt(Date.now())
+  const latest = usage.turns.at(-1)
   return {
     cost: fmtMoney(usage.cost),
+    lastTurn: latest ? fmtTurnMoney(latest.cost) : '—',
+    lastTurnLabel: latest ? `第 ${latest.turn} 轮（${turnTierLabel(latest)}）` : '还没有完成的回合',
+    tierCaption: `CNY · 现在${tierShort(nowTier)}${nowTier === 'off' ? '（半价）' : '（全价）'}`,
+    // "谷时 · 1小时12分后进入峰时" — the same countdown the desktop cost meter shows.
+    tierSwitch: nextTierSwitch(Date.now()) === null ? '' : tierSwitchText(Date.now()),
+    tierHint:
+      nowTier === 'off'
+        ? '现在是谷时，按峰时价 50% 计；峰时为工作日 09:00–12:00、14:00–18:00（不含法定节假日）。'
+        : '现在是峰时，按全价计；工作日 12:00–14:00、18:00 之后、周末和法定节假日为谷时（半价）。',
     tokens: fmtTokens(usage.tokens),
     cacheHit: fmtPct(usage.cacheHit),
     balance: balanceState.text,
@@ -375,13 +594,36 @@ function panelData(usage) {
       usage.models.length === 0
         ? [['暂无模型', '—', '—']]
         : usage.models.slice(0, 8).map((model) => [model.name, fmtTokens(model.tokens), fmtMoney(model.cost)]),
+    turnRows:
+      usage.turns.length === 0
+        ? [['暂无回合', '—', '—', '—']]
+        : usage.turns.slice(-50).map((turn) => [
+            `第 ${turn.turn} 轮`,
+            fmtTokens(totalOf(turn)),
+            fmtTurnMoney(turn.cost),
+            turnTierLabel(turn)
+          ]),
     tiers: [
-      ['高峰 tokens', fmtTokens(usage.peakTokens)],
-      ['空闲 tokens', fmtTokens(usage.offTokens)],
+      ['峰时费用', `${fmtMoney(usage.peakCost)} · ${fmtTokens(usage.peakTokens)} tok`],
+      ['谷时费用', `${fmtMoney(usage.offCost)} · ${fmtTokens(usage.offTokens)} tok`],
+      ['本次会话跨越', usage.peakTokens > 0 && usage.offTokens > 0 ? '峰时与谷时' : '单一时段'],
       ['计费请求', `${usage.requests} 次`],
       ['缓存节省', fmtMoney(usage.saved)]
     ]
   }
+}
+
+/** Turn note data: `{ <turn number>: { text, tone } }`, 16 characters per segment. */
+function turnNoteData(usage) {
+  const out = {}
+  // The bridge keeps the newest 64 turns anyway; sending more would only grow the payload.
+  for (const turn of usage.turns.slice(-64)) {
+    if (!(turn.cost > 0)) continue
+    const label = turn.peakTokens > 0 && turn.offTokens > 0 ? '峰谷' : turn.offTokens > 0 ? '谷' : '峰'
+    const tone = label === '谷' ? 'good' : label === '峰' ? 'warn' : 'info'
+    out[String(turn.turn)] = { text: `${fmtTurnMoney(turn.cost)}·${label}`, tone }
+  }
+  return out
 }
 
 const VIEW = {
@@ -389,11 +631,19 @@ const VIEW = {
   title: '用量与费用',
   children: [
     {
-      type: 'metric',
-      label: '本会话估算',
-      value: { $: 'data.cost' },
-      caption: 'CNY · 以官方账单为准'
+      type: 'row',
+      children: [
+        {
+          type: 'metric',
+          label: '本会话估算',
+          value: { $: 'data.cost' },
+          caption: { $: 'data.tierCaption' }
+        },
+        { type: 'metric', label: '本轮', value: { $: 'data.lastTurn' }, caption: { $: 'data.lastTurnLabel' } }
+      ]
     },
+    { type: 'callout', text: { $: 'data.tierSwitch' }, tone: 'info' },
+    { type: 'callout', text: { $: 'data.tierHint' }, tone: 'info' },
     {
       type: 'row',
       children: [
@@ -411,15 +661,20 @@ const VIEW = {
       tone: { $: 'data.contextTone' }
     },
     { type: 'keyValue', items: { $: 'data.breakdown' } },
+    { type: 'keyValue', items: { $: 'data.tiers' } },
+    {
+      type: 'table',
+      columns: ['回合', 'tokens', '费用', '时段'],
+      rows: { $: 'data.turnRows' }
+    },
     {
       type: 'table',
       columns: ['模型', 'tokens', '费用'],
       rows: { $: 'data.modelRows' }
     },
-    { type: 'keyValue', items: { $: 'data.tiers' } },
     {
       type: 'callout',
-      text: '估算值，以官方账单为准；空闲时段按高峰价 50% 计。',
+      text: '估算值，以官方账单为准；谷时（空闲时段）按峰时价 50% 计。',
       tone: 'info'
     }
   ]
@@ -427,12 +682,15 @@ const VIEW = {
 
 function summaryText(usage) {
   if (!usage || usage.tokens === 0) return '当前会话还没有用量。'
+  const latest = usage.turns.at(-1)
   return [
     '用量与费用（本会话估算）',
     `费用：${fmtMoney(usage.cost)} CNY`,
     `tokens：${fmtExact(usage.tokens)}（输入 ${fmtExact(usage.uncachedInput)} / 缓存 ${fmtExact(usage.cacheRead)} / 输出 ${fmtExact(usage.output)}）`,
     `缓存命中：${fmtPct(usage.cacheHit)}`,
     `计费请求：${usage.requests} 次`,
+    `峰时 ${fmtMoney(usage.peakCost)} / 谷时 ${fmtMoney(usage.offCost)}`,
+    latest ? `最近一轮：第 ${latest.turn} 轮 ${fmtMoney(latest.cost)}（${turnTierLabel(latest)}）` : '最近一轮：—',
     `账户余额：${balanceState.text}`,
     '估算值，以官方账单为准。'
   ].join('\n')
@@ -440,6 +698,23 @@ function summaryText(usage) {
 
 export function apply(ctx) {
   ctx.inject(['dshGo'], (ctx) => {
+    // Long-press a reply → this message's own turn cost. The app sends messageId with the
+    // tap; the fold remembers which turn each settled message belongs to.
+    ctx.dshGo.on('turn-cost', (scope) => {
+      const usage = computeUsage(ctx, scope.sessionId)
+      const byMessage = scope.messageId ? usage.messageTurns.get(scope.messageId) : undefined
+      // A given id that does not resolve must not borrow the newest turn's number — unless this
+      // log carries no reply ids at all, where the newest settled turn is the best we have.
+      if (scope.messageId && byMessage === undefined && usage.messageTurns.size > 0) {
+        return { toast: '这条回复还没结算，稍后再看' }
+      }
+      const turn =
+        (byMessage === undefined ? undefined : usage.turns.find((t) => t.turn === byMessage)) ?? usage.turns.at(-1)
+      if (!turn) return { toast: '这一轮还没有费用记录' }
+      const text = `第 ${turn.turn} 轮 ${fmtTurnMoney(turn.cost)}（${turnTierLabel(turn)}）`
+      return { copy: `第 ${turn.turn} 轮费用：${fmtMoney(turn.cost)} ${turnTierLabel(turn)}`, toast: text }
+    })
+
     ctx.dshGo.on('copy', (scope) => {
       const usage = computeUsage(ctx, scope.sessionId)
       if (usage.tokens === 0) return { toast: '当前会话还没有用量' }
@@ -487,5 +762,23 @@ export function apply(ctx) {
         }
       }
     })
+
+    // Per-turn cost on each turn's footnote: `¥0.021·峰`. Older bridges have no
+    // turnNote and would make later registrations unreachable, so probe first.
+    if (typeof ctx.dshGo.turnNote === 'function') {
+      ctx.dshGo.turnNote('turncost', (scope, emit) => {
+        let stopped = false
+        const push = () => {
+          if (stopped) return
+          emit(turnNoteData(computeUsage(ctx, scope.sessionId)))
+        }
+        push()
+        const timer = setInterval(push, TICK_MS)
+        return () => {
+          stopped = true
+          clearInterval(timer)
+        }
+      })
+    }
   })
 }
